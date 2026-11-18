@@ -380,42 +380,23 @@ def check_fleet_dashboard(page) -> dict:
     fleet_count = None
 
     try:
-        dropdown = page.locator("input[placeholder='Select Data Delay'], [placeholder='Select Data Delay']").first
-        dropdown.wait_for(timeout=10000)
-        dropdown.click()
+        # Locate the Data Delay multiselect specifically
+        dd = page.locator("kendo-multiselect#divdd8, #divdd8, kendo-multiselect[placeholder='Select Data Delay']").first
+        if not dd.is_visible(timeout=5000):
+            dd = page.locator("kendo-multiselect").filter(has_text=re.compile(r"Data Delay", re.I)).first
+        dd.scroll_into_view_if_needed()
+        dd.click()
         page.wait_for_timeout(1000)
 
-        selected = False
-        try:
-            opt = page.get_by_role("option", name="Communicating").first
-            if opt.is_visible(timeout=2000):
-                opt.click()
-                selected = True
-        except Exception:
-            pass
+        # Click exact 'Communicating' item (avoid matching 'Communication Lost')
+        opt = page.locator(".k-popup .k-item, kendo-popup li").filter(has_text=re.compile(r"^Communicating$")).first
+        if not opt.is_visible(timeout=3000):
+            opt = page.get_by_text("Communicating", exact=True).first
 
-        if not selected:
-            try:
-                opt = page.locator("li.k-item, .k-list-item, li").filter(has_text="Communicating").first
-                if opt.is_visible(timeout=2000):
-                    opt.click()
-                    selected = True
-            except Exception:
-                pass
-
-        if not selected:
-            try:
-                opt = page.get_by_text("Communicating", exact=True).first
-                if opt.is_visible(timeout=2000):
-                    opt.click()
-                    selected = True
-            except Exception:
-                pass
-
-        if not selected:
-            page.locator("li").filter(has_text="Communicating").first.click()
-
-        page.wait_for_timeout(1000)
+        opt.click()
+        page.wait_for_timeout(800)
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
         print("[FLEET] Selected 'Communicating' from dropdown.")
     except Exception as e:
         alerts.append(f"Fleet Dashboard: dropdown selection failed ({e})")
@@ -423,41 +404,44 @@ def check_fleet_dashboard(page) -> dict:
         return {"value": None, "alerts": alerts}
 
     try:
-        search_btn = page.locator("button:has-text('Search'), a:has-text('Search')").first
+        # Capture initial pager text before search
+        initial_pager = ""
+        pager_el = page.locator(".k-pager-info").first
+        if pager_el.is_visible(timeout=3000):
+            initial_pager = pager_el.inner_text().strip()
+        print(f"[FLEET] Initial unfiltered pager: {initial_pager}")
+
+        # Click Search button
+        search_btn = page.locator("a.k-button.k-primary:has-text('Search'), a:has-text('Search'), button:has-text('Search')").first
         search_btn.click()
         print("[FLEET] Clicked Search button.")
-    except Exception as e:
-        alerts.append(f"Fleet Dashboard: search button click failed ({e})")
-        print(f"[FLEET] ERROR clicking search: {e}")
-        return {"value": None, "alerts": alerts}
 
-    try:
-        page.wait_for_selector(".k-loading-mask", state="hidden", timeout=15000)
-    except Exception:
-        pass
-    page.wait_for_timeout(4000)
+        # Wait for loading mask to show and hide
+        try:
+            page.wait_for_selector(".k-loading-mask", state="visible", timeout=3000)
+            page.wait_for_selector(".k-loading-mask", state="hidden", timeout=20000)
+        except Exception:
+            pass
 
-    try:
-        pager_el = page.locator(".k-pager-info").first
-        if pager_el.is_visible(timeout=5000):
-            raw_pager = pager_el.inner_text().strip()
-            print(f"[FLEET] Pager text: {repr(raw_pager)}")
-            m = re.search(r"of\s+([\d,]+)\s+items", raw_pager, re.IGNORECASE)
-            if m:
-                fleet_count = int(m.group(1).replace(",", ""))
-
-        if fleet_count is None:
-            total_el = page.locator(
-                "xpath=/html/body/ngx-app/ngx-pages/ngx-one-column-layout/nb-layout"
-                "/div/div/div/div/div/nb-layout-column/ngx-fleetdashboard/div/div"
-                "/div[2]/div[2]"
-            )
-            total_el.wait_for(timeout=5000)
-            raw = total_el.inner_text().strip()
-            print(f"[FLEET] Header raw text: {repr(raw)}")
-            tokens = re.findall(r'\b\d+\b', raw)
-            if tokens:
-                fleet_count = int(tokens[-1])
+        # Wait for pager text to update to the filtered count
+        t0 = time.time()
+        while time.time() - t0 < 15.0:
+            page.wait_for_timeout(1000)
+            pager_el = page.locator(".k-pager-info").first
+            if pager_el.is_visible():
+                current_pager = pager_el.inner_text().strip()
+                if current_pager and current_pager != initial_pager and "of" in current_pager:
+                    print(f"[FLEET] Filtered pager text: {repr(current_pager)}")
+                    m = re.search(r"of\s+([\d,]+)\s+items", current_pager, re.IGNORECASE)
+                    if m:
+                        fleet_count = int(m.group(1).replace(",", ""))
+                        break
+                elif time.time() - t0 > 8.0:
+                    m = re.search(r"of\s+([\d,]+)\s+items", current_pager, re.IGNORECASE)
+                    if m:
+                        fleet_count = int(m.group(1).replace(",", ""))
+                        print(f"[FLEET] Fallback pager text: {repr(current_pager)}")
+                        break
 
         if fleet_count is not None:
             status = "OK" if fleet_count >= FLEET_MIN_COMM else "BREACH"
@@ -465,9 +449,10 @@ def check_fleet_dashboard(page) -> dict:
             if fleet_count < FLEET_MIN_COMM:
                 alerts.append(f"Communicating Fleet = {fleet_count} (minimum: {FLEET_MIN_COMM})")
         else:
-            alerts.append("Fleet Dashboard: failed to parse numeric count from pager or header")
+            alerts.append("Fleet Dashboard: failed to parse numeric count from pager")
     except Exception as e:
         alerts.append(f"Fleet Dashboard: could not read Communicating Fleet value ({e})")
+        print(f"[FLEET] ERROR reading Communicating Fleet value: {e}")
         print(f"[FLEET] ERROR reading fleet count: {e}")
 
     return {"value": fleet_count, "alerts": alerts}
