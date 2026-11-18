@@ -1,11 +1,7 @@
 """
 MTC Bus ITS Portal – 15-Minute Health Monitor
-GitHub Actions headless Playwright script.
-All credentials loaded from environment variables (GitHub Secrets).
-
-Updated: Routes browser traffic through an Indian proxy so the script
-can run on any GitHub-hosted runner (ubuntu-latest) instead of requiring
-a self-hosted runner physically located in India.
+Headless Playwright monitoring script for GitHub Actions & Local execution.
+All credentials loaded from environment variables (GitHub Secrets or Local Env).
 """
 
 import os
@@ -28,15 +24,19 @@ from playwright.sync_api import sync_playwright
 
 # ── Load config ────────────────────────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+if not os.path.exists(_CONFIG_PATH):
+    # Fallback to local directory
+    _CONFIG_PATH = "config.json"
+
 with open(_CONFIG_PATH, "r", encoding="utf-8") as _f:
     CONFIG = json.load(_f)
 
 PIS_MAX_DOWN     = CONFIG["pis_display_max_down"]          # {"2L": 20, "4L": 6, "10L": 3}
 FLEET_MIN_COMM   = CONFIG["fleet_dashboard_min_communicating"]  # 2500
 
-# ── Credentials from environment (GitHub Secrets) ─────────────────────────────
-USERNAME  = os.getenv("MTC_USERNAME", "")
-PASSWORD  = os.getenv("MTC_PASSWORD", "")
+# ── Credentials from environment (GitHub Secrets or defaults) ─────────────────
+USERNAME  = os.getenv("MTC_USERNAME", "").strip()
+PASSWORD  = os.getenv("MTC_PASSWORD", "").strip()
 
 # ── IST helper ────────────────────────────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -47,7 +47,7 @@ def now_ist() -> str:
 
 # ── Alert via ntfy.sh ─────────────────────────────────────────────────────────
 def send_alert(message: str):
-    topic = os.getenv("NTFY_TOPIC")
+    topic = os.getenv("NTFY_TOPIC", "").strip()
     if not topic:
         print("[WARN] NTFY_TOPIC secret not set. Skipping mobile push alert.")
         return
@@ -67,103 +67,63 @@ def send_alert(message: str):
         print(f"[ALERT] Failed to send ntfy alert: {e}")
 
 
-# ── Indian Proxy Fetching ─────────────────────────────────────────────────────
-def fetch_indian_proxies() -> list:
-    """
-    Fetches a list of free Indian HTTP/HTTPS proxies from multiple sources.
-    Returns a list of proxy strings like 'http://ip:port'.
-    Falls back to hardcoded known Indian proxy endpoints if APIs fail.
-    """
-    proxies = []
-
-    # Source 1: ProxyScrape — free Indian HTTP proxies
-    sources = [
-        "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&country=in&protocol=http&timeout=5000",
-        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=in&ssl=all&anonymity=all",
-    ]
-
-    for url in sources:
-        try:
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200 and resp.text.strip():
-                for line in resp.text.strip().splitlines():
-                    line = line.strip()
-                    if line and ":" in line:
-                        # Ensure format is ip:port
-                        parts = line.split(":")
-                        if len(parts) == 2 and parts[1].isdigit():
-                            proxies.append(f"http://{line}")
-        except Exception as e:
-            print(f"[PROXY] Failed to fetch from {url[:60]}...: {e}")
-
-    # Source 2: Geonode free proxy API
+# ── Network & Indian Proxy Detection ──────────────────────────────────────────
+def is_direct_connection_available() -> bool:
+    """Test if mtcbusits.in can be reached directly (e.g. runner is already in India)."""
     try:
-        resp = requests.get(
-            "https://proxylist.geonode.com/api/proxy-list?limit=50&page=1&sort_by=lastChecked&sort_type=desc&country=IN&protocols=http%2Chttps",
-            timeout=10
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            for entry in data.get("data", []):
-                ip = entry.get("ip")
-                port = entry.get("port")
-                if ip and port:
-                    proxies.append(f"http://{ip}:{port}")
-    except Exception as e:
-        print(f"[PROXY] Failed to fetch from Geonode: {e}")
-
-    # Deduplicate
-    seen = set()
-    unique = []
-    for p in proxies:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
-
-    print(f"[PROXY] Fetched {len(unique)} Indian proxies")
-    return unique
-
-
-def test_proxy(proxy_url: str, timeout: int = 8) -> bool:
-    """Quick test: can this proxy reach an external site and report an Indian IP?"""
-    try:
-        resp = requests.get(
-            "https://ipapi.co/json/",
-            proxies={"http": proxy_url, "https": proxy_url},
-            timeout=timeout
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            country = data.get("country_code", "").upper()
-            ip = data.get("ip", "unknown")
-            if country == "IN":
-                print(f"[PROXY] ✅ Working Indian proxy: {proxy_url} → IP={ip}")
-                return True
-            else:
-                print(f"[PROXY] ❌ Proxy {proxy_url} routes to {country} (not IN)")
+        r = requests.get("https://mtcbusits.in/", timeout=5)
+        if r.status_code == 200:
+            print("[CONNECT] Direct connection to mtcbusits.in succeeded (Indian IP active ✅)")
+            return True
     except Exception:
         pass
     return False
 
 
 def get_working_indian_proxy() -> str:
-    """Find a working Indian proxy from free proxy lists."""
-    proxies = fetch_indian_proxies()
-    if not proxies:
-        print("[PROXY] No Indian proxies found from any source!")
-        return ""
+    """
+    If INDIAN_PROXY is provided in env, use it.
+    Otherwise scan public lists for an active proxy that can connect to mtcbusits.in.
+    """
+    explicit_proxy = os.getenv("INDIAN_PROXY", "").strip()
+    if explicit_proxy:
+        print(f"[PROXY] Using configured INDIAN_PROXY: {explicit_proxy}")
+        return explicit_proxy
 
-    # Test up to 30 proxies to find a working one
-    for i, proxy in enumerate(proxies[:30]):
-        print(f"[PROXY] Testing proxy {i+1}/{min(len(proxies), 30)}: {proxy}")
-        if test_proxy(proxy):
-            return proxy
+    print("[PROXY] Scanning for free Indian proxies with HTTPS CONNECT support...")
+    sources = [
+        "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&country=in&protocol=http,socks5",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt"
+    ]
 
-    print("[PROXY] No working Indian proxy found after testing!")
+    candidate_proxies = []
+    for s in sources:
+        try:
+            resp = requests.get(s, timeout=8)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line and ":" in line and not line.startswith("#"):
+                        candidate_proxies.append(f"http://{line}")
+        except Exception:
+            pass
+
+    print(f"[PROXY] Found {len(candidate_proxies)} candidate proxies to test...")
+    # Test up to 15 candidates against mtcbusits.in with a short timeout
+    for i, p in enumerate(candidate_proxies[:15]):
+        try:
+            r = requests.get("https://mtcbusits.in/", proxies={"http": p, "https": p}, timeout=4)
+            if r.status_code == 200:
+                print(f"[PROXY] ✅ Working proxy found: {p}")
+                return p
+        except Exception:
+            pass
+
+    print("[PROXY] No working public proxy found.")
     return ""
 
 
-# ── CAPTCHA OCR case refinement (ported exactly from DPCSR.py) ────────────────
+# ── CAPTCHA OCR case refinement ───────────────────────────────────────────────
 def refine_captcha_case(img_bytes: bytes, pred_text: str) -> str:
     """
     Refines uppercase/lowercase case of characters based on character bounding box heights
@@ -192,7 +152,6 @@ def refine_captcha_case(img_bytes: bytes, pred_text: str) -> str:
             if area > 12 and h >= 6:
                 boxes.append((x, y, w, h))
 
-        # Merge components belonging to same character column (e.g. dot of 'i' or 'j', or split parts)
         boxes.sort(key=lambda b: b[0])
         merged = []
         for b in boxes:
@@ -217,7 +176,6 @@ def refine_captcha_case(img_bytes: bytes, pred_text: str) -> str:
                 w, h = merged[idx][2], merged[idx][3]
                 lower_ch = ch.lower()
 
-                # Ambiguous letters where upper/lower cases share identical geometry
                 if lower_ch in ['c', 'o', 's', 'u', 'v', 'w', 'x', 'z']:
                     if h >= 27:
                         chars[idx] = lower_ch.upper()
@@ -245,22 +203,22 @@ def refine_captcha_case(img_bytes: bytes, pred_text: str) -> str:
     return pred_text
 
 
-# ── Login (adapted from DPCSR.py — no manual fallback, 35 retries) ────────────
+# ── Login ─────────────────────────────────────────────────────────────────────
 def login_to_portal(page):
     print("[LOGIN]  Navigating to MTC Portal...")
-    # Retry navigation up to 3 times with 90s timeout
     for nav_attempt in range(3):
         try:
-            page.goto("https://mtcbusits.in/", timeout=90000, wait_until="domcontentloaded")
+            page.goto("https://mtcbusits.in/", timeout=45000, wait_until="domcontentloaded")
             break
         except Exception as e:
             print(f"[LOGIN]  Navigation attempt {nav_attempt+1} failed: {e}")
             if nav_attempt == 2:
                 raise RuntimeError(f"Cannot reach https://mtcbusits.in/ after 3 attempts: {e}")
-            page.wait_for_timeout(5000)
+            page.wait_for_timeout(3000)
+
     page.wait_for_selector("input[formcontrolname='captcha'], input[name='captcha']", timeout=30000)
 
-    # Initialize fast OCR
+    # Fast OCR
     ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
     ocr.set_ranges(string.ascii_letters + string.digits)
 
@@ -302,7 +260,7 @@ def login_to_portal(page):
         base64_data = src.split(",")[1]
         image_data = base64.b64decode(base64_data)
 
-        # Run fast OCR & refine case
+        # Fast OCR & refine case
         raw_pred = ocr.classification(image_data).strip()
         refined_captcha = refine_captcha_case(image_data, raw_pred)
         print(f"[LOGIN]  Extracted CAPTCHA: '{refined_captcha}'")
@@ -362,8 +320,7 @@ def login_to_portal(page):
 
     if not logged_in:
         raise RuntimeError(
-            f"[LOGIN]  Login failed after {max_auto_attempts} CAPTCHA attempts. "
-            "Raising exception so an alert is sent."
+            f"[LOGIN]  Login failed after {max_auto_attempts} CAPTCHA attempts."
         )
 
     return True
@@ -375,14 +332,12 @@ def check_pis_display(page) -> dict:
     print("[PIS]  Navigating to PIS Display Connectivity...")
     page.goto("https://mtcbusits.in/avls/Vehicletracking/PISDisplayConnectivity", timeout=30000)
 
-    # Wait for kendo grid toolbar to appear
     page.wait_for_selector("kendo-grid-toolbar", timeout=15000)
 
-    # Wait for any loading masks to disappear
     try:
         page.wait_for_selector(".k-loading-mask", state="hidden", timeout=15000)
     except Exception:
-        pass  # may not be present
+        pass
     page.wait_for_timeout(2000)
 
     xpaths = {
@@ -425,15 +380,12 @@ def check_fleet_dashboard(page) -> dict:
     fleet_count = None
 
     try:
-        # Click the Data Delay dropdown input
         dropdown = page.locator("input[placeholder='Select Data Delay'], [placeholder='Select Data Delay']").first
         dropdown.wait_for(timeout=10000)
         dropdown.click()
         page.wait_for_timeout(1000)
 
-        # Select "Communicating" option from the dropdown popup
         selected = False
-        # Strategy 1: Kendo option role
         try:
             opt = page.get_by_role("option", name="Communicating").first
             if opt.is_visible(timeout=2000):
@@ -442,7 +394,6 @@ def check_fleet_dashboard(page) -> dict:
         except Exception:
             pass
 
-        # Strategy 2: Kendo list item class
         if not selected:
             try:
                 opt = page.locator("li.k-item, .k-list-item, li").filter(has_text="Communicating").first
@@ -452,7 +403,6 @@ def check_fleet_dashboard(page) -> dict:
             except Exception:
                 pass
 
-        # Strategy 3: Text match
         if not selected:
             try:
                 opt = page.get_by_text("Communicating", exact=True).first
@@ -463,7 +413,6 @@ def check_fleet_dashboard(page) -> dict:
                 pass
 
         if not selected:
-            # Fallback click via locator filter
             page.locator("li").filter(has_text="Communicating").first.click()
 
         page.wait_for_timeout(1000)
@@ -474,7 +423,6 @@ def check_fleet_dashboard(page) -> dict:
         return {"value": None, "alerts": alerts}
 
     try:
-        # Click Search/Filter button
         search_btn = page.locator("button:has-text('Search'), a:has-text('Search')").first
         search_btn.click()
         print("[FLEET] Clicked Search button.")
@@ -483,7 +431,6 @@ def check_fleet_dashboard(page) -> dict:
         print(f"[FLEET] ERROR clicking search: {e}")
         return {"value": None, "alerts": alerts}
 
-    # Wait for loading to complete
     try:
         page.wait_for_selector(".k-loading-mask", state="hidden", timeout=15000)
     except Exception:
@@ -491,7 +438,6 @@ def check_fleet_dashboard(page) -> dict:
     page.wait_for_timeout(4000)
 
     try:
-        # 1. Extract Communicating Fleet count from kendo pager (e.g. '1 - 10 of 758 items')
         pager_el = page.locator(".k-pager-info").first
         if pager_el.is_visible(timeout=5000):
             raw_pager = pager_el.inner_text().strip()
@@ -500,7 +446,6 @@ def check_fleet_dashboard(page) -> dict:
             if m:
                 fleet_count = int(m.group(1).replace(",", ""))
 
-        # 2. Fallback to top header card if pager not matched
         if fleet_count is None:
             total_el = page.locator(
                 "xpath=/html/body/ngx-app/ngx-pages/ngx-one-column-layout/nb-layout"
@@ -543,22 +488,18 @@ def main():
 
     all_alerts = []
 
-    # ── Determine proxy configuration ──────────────────────────────────────
-    # If INDIAN_PROXY is explicitly set (e.g. via GitHub Secret), use it directly.
-    # Otherwise, auto-fetch a free Indian proxy from public lists.
-    proxy_server = os.getenv("INDIAN_PROXY", "").strip()
-
-    if not proxy_server:
-        print("[PROXY] No INDIAN_PROXY env var set. Auto-fetching free Indian proxy...")
-        proxy_server = get_working_indian_proxy()
-
-    if proxy_server:
-        print(f"[PROXY] Using Indian proxy: {proxy_server}")
-        proxy_config = {"server": proxy_server}
+    # Check network connectivity mode
+    proxy_config = None
+    if is_direct_connection_available():
+        print("[NETWORK] Running via direct Indian connection.")
     else:
-        print("[PROXY] WARNING: No Indian proxy available. Attempting direct connection...")
-        print("[PROXY] This may fail if the runner IP is outside India.")
-        proxy_config = None
+        print("[NETWORK] Direct connection unavailable (outside India). Attempting proxy routing...")
+        proxy_server = get_working_indian_proxy()
+        if proxy_server:
+            proxy_config = {"server": proxy_server}
+            print(f"[NETWORK] Browser routed through proxy: {proxy_server}")
+        else:
+            print("[NETWORK] WARNING: No Indian proxy available. Trying direct fallback...")
 
     with sync_playwright() as p:
         launch_kwargs = {"headless": True}
@@ -570,15 +511,6 @@ def main():
         page = context.new_page()
 
         try:
-            # Verify IP location before proceeding
-            if proxy_config:
-                try:
-                    page.goto("https://ipapi.co/json/", timeout=15000)
-                    ip_info = json.loads(page.locator("body").inner_text())
-                    print(f"[PROXY] Browser IP: {ip_info.get('ip')} | Country: {ip_info.get('country_name')} ({ip_info.get('country_code')})")
-                except Exception as e:
-                    print(f"[PROXY] Could not verify IP location: {e}")
-
             # Login
             login_to_portal(page)
 
@@ -590,7 +522,7 @@ def main():
             fleet_result = check_fleet_dashboard(page)
             all_alerts.extend(fleet_result["alerts"])
 
-            # Format full metrics breakdown for all 4 values
+            # Format report
             pis_vals = pis_result["values"]
             comm_val = fleet_result["value"]
             
@@ -619,7 +551,8 @@ def main():
                 print(f"\n[ALERT] Threshold breach(es) detected:\n{full_report}")
                 send_alert(full_report)
             else:
-                print("\n[OK] All metrics within thresholds. No alerts sent.")
+                print("\n[OK] All metrics within thresholds. Sending status report...")
+                send_alert(full_report)
 
         except Exception as exc:
             print(f"\n[ERROR] Unexpected exception: {exc}")
