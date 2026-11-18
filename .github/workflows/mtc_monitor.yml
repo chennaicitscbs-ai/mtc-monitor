@@ -21,10 +21,10 @@ jobs:
           echo "${{ secrets.OVPN_CONFIG }}" > /tmp/client.ovpn
           printf "%s\n%s\n" "${{ secrets.VPN_USERNAME }}" "${{ secrets.VPN_PASSWORD }}" > /tmp/vpn_auth.txt
           chmod 600 /tmp/vpn_auth.txt /tmp/client.ovpn
-          sudo openvpn --config /tmp/client.ovpn --auth-user-pass /tmp/vpn_auth.txt --log /tmp/openvpn.log --daemon vpn-tunnel
+          sudo openvpn --config /tmp/client.ovpn --auth-user-pass /tmp/vpn_auth.txt --data-ciphers "AES-128-CBC:AES-256-GCM:AES-128-GCM:BF-CBC" --data-ciphers-fallback AES-128-CBC --verb 4 --log /tmp/openvpn.log --daemon vpn-tunnel
           
-          # Wait up to 20 seconds for VPN tunnel to initialize
-          for i in {1..20}; do
+          # Wait up to 25 seconds for VPN tunnel to initialize
+          for i in {1..25}; do
             if ip a show tun0 > /dev/null 2>&1; then
               echo "✅ VPN tunnel tun0 is UP!"
               break
@@ -33,7 +33,7 @@ jobs:
           done
           
           echo "--- OpenVPN Log ---"
-          cat /tmp/openvpn.log || true
+          sudo cat /tmp/openvpn.log || true
           
           echo "Outgoing Public IP:"
           curl -s --max-time 10 https://api.ipify.org || true
