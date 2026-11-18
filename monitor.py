@@ -360,7 +360,7 @@ def check_pis_display(page) -> dict:
     page.goto("https://mtcbusits.in/avls/Vehicletracking/PISDisplayConnectivity", timeout=60000, wait_until="domcontentloaded")
 
     # Allow up to 60s for Angular bundle and grid toolbar to finish loading
-    page.wait_for_selector("kendo-grid-toolbar", timeout=60000)
+    page.wait_for_selector("kendo-grid-toolbar, #gridlistid, .k-grid", timeout=60000)
 
     try:
         page.wait_for_selector(".k-loading-mask", state="hidden", timeout=30000)
@@ -521,6 +521,24 @@ def main():
         browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context()
         page = context.new_page()
+
+        # Intercept and block heavy non-essential assets (fonts, media, images, maps)
+        def intercept_requests(route):
+            req = route.request
+            url = req.url.lower()
+            res_type = req.resource_type
+            if "data:image" in url or "captcha" in url:
+                route.continue_()
+                return
+            if res_type in ["image", "media", "font"]:
+                route.abort()
+                return
+            if any(k in url for k in ["mapsjs", "here.com", "google-analytics", "doubleclick", "googletagmanager", "clarity"]):
+                route.abort()
+                return
+            route.continue_()
+
+        page.route("**/*", intercept_requests)
 
         try:
             # Login
