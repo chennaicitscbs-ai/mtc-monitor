@@ -1,0 +1,641 @@
+"""
+MTC Bus ITS Portal – 15-Minute Health Monitor
+GitHub Actions headless Playwright script.
+All credentials loaded from environment variables (GitHub Secrets).
+
+Updated: Routes browser traffic through an Indian proxy so the script
+can run on any GitHub-hosted runner (ubuntu-latest) instead of requiring
+a self-hosted runner physically located in India.
+"""
+
+import os
+import sys
+import json
+import base64
+import string
+import time
+import re
+from datetime import datetime, timezone, timedelta
+
+# Ensure unbuffered output
+sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+
+import numpy as np
+import cv2
+import ddddocr
+import requests
+from playwright.sync_api import sync_playwright
+
+# ── Load config ────────────────────────────────────────────────────────────────
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+with open(_CONFIG_PATH, "r", encoding="utf-8") as _f:
+    CONFIG = json.load(_f)
+
+PIS_MAX_DOWN     = CONFIG["pis_display_max_down"]          # {"2L": 20, "4L": 6, "10L": 3}
+FLEET_MIN_COMM   = CONFIG["fleet_dashboard_min_communicating"]  # 2500
+
+# ── Credentials from environment (GitHub Secrets) ─────────────────────────────
+USERNAME  = os.getenv("MTC_USERNAME", "")
+PASSWORD  = os.getenv("MTC_PASSWORD", "")
+
+# ── IST helper ────────────────────────────────────────────────────────────────
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist() -> str:
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+# ── Alert via ntfy.sh ─────────────────────────────────────────────────────────
+def send_alert(message: str):
+    topic = os.getenv("NTFY_TOPIC")
+    if not topic:
+        print("[WARN] NTFY_TOPIC secret not set. Skipping mobile push alert.")
+        return
+    try:
+        resp = requests.post(
+            f"https://ntfy.sh/{topic.strip()}",
+            data=message.encode("utf-8"),
+            headers={
+                "Title": "MTC ITS Portal Alert",
+                "Priority": "urgent",
+                "Tags": "warning,bus"
+            },
+            timeout=15
+        )
+        print(f"[ALERT] ntfy.sh Status: {resp.status_code}")
+    except Exception as e:
+        print(f"[ALERT] Failed to send ntfy alert: {e}")
+
+
+# ── Indian Proxy Fetching ─────────────────────────────────────────────────────
+def fetch_indian_proxies() -> list:
+    """
+    Fetches a list of free Indian HTTP/HTTPS proxies from multiple sources.
+    Returns a list of proxy strings like 'http://ip:port'.
+    Falls back to hardcoded known Indian proxy endpoints if APIs fail.
+    """
+    proxies = []
+
+    # Source 1: ProxyScrape — free Indian HTTP proxies
+    sources = [
+        "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&country=in&protocol=http&timeout=5000",
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=in&ssl=all&anonymity=all",
+    ]
+
+    for url in sources:
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200 and resp.text.strip():
+                for line in resp.text.strip().splitlines():
+                    line = line.strip()
+                    if line and ":" in line:
+                        # Ensure format is ip:port
+                        parts = line.split(":")
+                        if len(parts) == 2 and parts[1].isdigit():
+                            proxies.append(f"http://{line}")
+        except Exception as e:
+            print(f"[PROXY] Failed to fetch from {url[:60]}...: {e}")
+
+    # Source 2: Geonode free proxy API
+    try:
+        resp = requests.get(
+            "https://proxylist.geonode.com/api/proxy-list?limit=50&page=1&sort_by=lastChecked&sort_type=desc&country=IN&protocols=http%2Chttps",
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            for entry in data.get("data", []):
+                ip = entry.get("ip")
+                port = entry.get("port")
+                if ip and port:
+                    proxies.append(f"http://{ip}:{port}")
+    except Exception as e:
+        print(f"[PROXY] Failed to fetch from Geonode: {e}")
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for p in proxies:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+
+    print(f"[PROXY] Fetched {len(unique)} Indian proxies")
+    return unique
+
+
+def test_proxy(proxy_url: str, timeout: int = 8) -> bool:
+    """Quick test: can this proxy reach an external site and report an Indian IP?"""
+    try:
+        resp = requests.get(
+            "https://ipapi.co/json/",
+            proxies={"http": proxy_url, "https": proxy_url},
+            timeout=timeout
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            country = data.get("country_code", "").upper()
+            ip = data.get("ip", "unknown")
+            if country == "IN":
+                print(f"[PROXY] ✅ Working Indian proxy: {proxy_url} → IP={ip}")
+                return True
+            else:
+                print(f"[PROXY] ❌ Proxy {proxy_url} routes to {country} (not IN)")
+    except Exception:
+        pass
+    return False
+
+
+def get_working_indian_proxy() -> str:
+    """Find a working Indian proxy from free proxy lists."""
+    proxies = fetch_indian_proxies()
+    if not proxies:
+        print("[PROXY] No Indian proxies found from any source!")
+        return ""
+
+    # Test up to 30 proxies to find a working one
+    for i, proxy in enumerate(proxies[:30]):
+        print(f"[PROXY] Testing proxy {i+1}/{min(len(proxies), 30)}: {proxy}")
+        if test_proxy(proxy):
+            return proxy
+
+    print("[PROXY] No working Indian proxy found after testing!")
+    return ""
+
+
+# ── CAPTCHA OCR case refinement (ported exactly from DPCSR.py) ────────────────
+def refine_captcha_case(img_bytes: bytes, pred_text: str) -> str:
+    """
+    Refines uppercase/lowercase case of characters based on character bounding box heights
+    in the uncompressed PNG image.
+    """
+    if len(pred_text) != 6:
+        return pred_text
+
+    try:
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return pred_text
+
+        if len(img.shape) >= 3 and img.shape[2] == 4:
+            b, g, r = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+            fg = ((b < 240) | (g < 240) | (r < 240)) & (img[:, :, 3] > 50)
+        else:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            fg = gray < 240
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(fg.astype(np.uint8))
+        boxes = []
+        for i in range(1, num_labels):
+            x, y, w, h, area = stats[i]
+            if area > 12 and h >= 6:
+                boxes.append((x, y, w, h))
+
+        # Merge components belonging to same character column (e.g. dot of 'i' or 'j', or split parts)
+        boxes.sort(key=lambda b: b[0])
+        merged = []
+        for b in boxes:
+            x, y, w, h = b
+            if not merged:
+                merged.append([x, y, w, h])
+            else:
+                px, py, pw, ph = merged[-1]
+                if x < px + pw or (x - (px + pw) <= 2 and len(merged) >= 6):
+                    nx1 = min(px, x)
+                    ny1 = min(py, y)
+                    nx2 = max(px + pw, x + w)
+                    ny2 = max(py + ph, y + h)
+                    merged[-1] = [nx1, ny1, nx2 - nx1, ny2 - ny1]
+                else:
+                    merged.append([x, y, w, h])
+
+        if len(merged) == 6:
+            chars = list(pred_text)
+            for idx in range(6):
+                ch = chars[idx]
+                w, h = merged[idx][2], merged[idx][3]
+                lower_ch = ch.lower()
+
+                # Ambiguous letters where upper/lower cases share identical geometry
+                if lower_ch in ['c', 'o', 's', 'u', 'v', 'w', 'x', 'z']:
+                    if h >= 27:
+                        chars[idx] = lower_ch.upper()
+                    elif h <= 25:
+                        chars[idx] = lower_ch.lower()
+                elif lower_ch in ['n', 'm']:
+                    if h >= 28:
+                        chars[idx] = lower_ch.upper()
+                    else:
+                        chars[idx] = lower_ch.lower()
+                elif lower_ch in ['p', 'q']:
+                    if w >= 28 or h >= 35:
+                        chars[idx] = lower_ch.upper()
+                    else:
+                        chars[idx] = lower_ch.lower()
+                elif lower_ch == 'k':
+                    if h >= 28 and w >= 25:
+                        chars[idx] = 'K'
+                    else:
+                        chars[idx] = 'k'
+            return "".join(chars)
+    except Exception:
+        pass
+
+    return pred_text
+
+
+# ── Login (adapted from DPCSR.py — no manual fallback, 35 retries) ────────────
+def login_to_portal(page):
+    print("[LOGIN]  Navigating to MTC Portal...")
+    # Retry navigation up to 3 times with 90s timeout
+    for nav_attempt in range(3):
+        try:
+            page.goto("https://mtcbusits.in/", timeout=90000, wait_until="domcontentloaded")
+            break
+        except Exception as e:
+            print(f"[LOGIN]  Navigation attempt {nav_attempt+1} failed: {e}")
+            if nav_attempt == 2:
+                raise RuntimeError(f"Cannot reach https://mtcbusits.in/ after 3 attempts: {e}")
+            page.wait_for_timeout(5000)
+    page.wait_for_selector("input[formcontrolname='captcha'], input[name='captcha']", timeout=30000)
+
+    # Initialize fast OCR
+    ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
+    ocr.set_ranges(string.ascii_letters + string.digits)
+
+    logged_in = False
+    max_auto_attempts = 35
+
+    for attempt in range(1, max_auto_attempts + 1):
+        cur_url = page.url.lower().rstrip("/")
+        if "login" not in cur_url and cur_url != "https://mtcbusits.in":
+            logged_in = True
+            break
+
+        print(f"[LOGIN]  Auto-solving CAPTCHA (attempt {attempt}/{max_auto_attempts})...")
+
+        # Fill credentials
+        page.locator("input[name='UserName'], input[name='username']").first.fill(USERNAME)
+        page.locator("input[id='password'], input[name='password']").first.fill(PASSWORD)
+
+        # Wait for captcha image
+        img_el = page.query_selector("img[src^='data:image']")
+        if not img_el:
+            page.wait_for_timeout(1000)
+            img_el = page.query_selector("img[src^='data:image']")
+
+        if not img_el:
+            print("[LOGIN]  Captcha image not found, reloading...")
+            try:
+                page.locator(".k-i-reload").click(timeout=1500)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+            continue
+
+        src = img_el.get_attribute("src") or ""
+        if not src.startswith("data:image"):
+            page.wait_for_timeout(1000)
+            continue
+
+        base64_data = src.split(",")[1]
+        image_data = base64.b64decode(base64_data)
+
+        # Run fast OCR & refine case
+        raw_pred = ocr.classification(image_data).strip()
+        refined_captcha = refine_captcha_case(image_data, raw_pred)
+        print(f"[LOGIN]  Extracted CAPTCHA: '{refined_captcha}'")
+
+        if len(refined_captcha) != 6:
+            print(f"[LOGIN]  Captcha length is {len(refined_captcha)} (expected 6). Refreshing...")
+            old_src = src
+            try:
+                page.locator(".k-i-reload").click(timeout=1500)
+            except Exception:
+                pass
+            for _ in range(20):
+                page.wait_for_timeout(150)
+                new_img = page.query_selector("img[src^='data:image']")
+                if new_img and (new_img.get_attribute("src") or "") != old_src:
+                    break
+            continue
+
+        # Enter captcha
+        cap_input = page.locator("input[formcontrolname='captcha'], input[name='captcha']").first
+        cap_input.fill("")
+        cap_input.fill(refined_captcha)
+        page.wait_for_timeout(200)
+
+        # Click Login
+        old_src = src
+        page.locator("button:has-text('Login')").first.click()
+
+        # Check for success or error toast
+        t0 = time.time()
+        while time.time() - t0 < 4.0:
+            page.wait_for_timeout(200)
+            cur_url = page.url.lower().rstrip("/")
+            if "login" not in cur_url and cur_url != "https://mtcbusits.in":
+                logged_in = True
+                break
+            toast = page.query_selector(".toast-message, .alert")
+            if toast and "invalid captcha" in toast.inner_text().lower():
+                break
+
+        if logged_in:
+            print("[LOGIN]  Successfully logged in!")
+            return True
+
+        print("[LOGIN]  CAPTCHA was rejected. Waiting for next CAPTCHA...")
+        for _ in range(25):
+            page.wait_for_timeout(150)
+            new_img = page.query_selector("img[src^='data:image']")
+            if new_img and (new_img.get_attribute("src") or "") != old_src:
+                break
+        else:
+            try:
+                page.locator(".k-i-reload").click(timeout=1000)
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+
+    if not logged_in:
+        raise RuntimeError(
+            f"[LOGIN]  Login failed after {max_auto_attempts} CAPTCHA attempts. "
+            "Raising exception so an alert is sent."
+        )
+
+    return True
+
+
+# ── Check 1: PIS Display Connectivity ─────────────────────────────────────────
+def check_pis_display(page) -> dict:
+    """Navigate to PIS Display Connectivity page and extract down counts."""
+    print("[PIS]  Navigating to PIS Display Connectivity...")
+    page.goto("https://mtcbusits.in/avls/Vehicletracking/PISDisplayConnectivity", timeout=30000)
+
+    # Wait for kendo grid toolbar to appear
+    page.wait_for_selector("kendo-grid-toolbar", timeout=15000)
+
+    # Wait for any loading masks to disappear
+    try:
+        page.wait_for_selector(".k-loading-mask", state="hidden", timeout=15000)
+    except Exception:
+        pass  # may not be present
+    page.wait_for_timeout(2000)
+
+    xpaths = {
+        "2L":  '//*[@id="gridlistid"]/kendo-grid-toolbar/div/div[7]/div[1]/span[3]',
+        "4L":  '//*[@id="gridlistid"]/kendo-grid-toolbar/div/div[7]/div[2]/span[3]',
+        "10L": '//*[@id="gridlistid"]/kendo-grid-toolbar/div/div[7]/div[3]/span[3]',
+    }
+
+    results = {}
+    alerts = []
+
+    for key, xpath in xpaths.items():
+        try:
+            el = page.locator(f"xpath={xpath}")
+            el.wait_for(timeout=10000)
+            raw = el.inner_text().strip()
+            value = int("".join(filter(str.isdigit, raw)))
+            results[key] = value
+            limit = PIS_MAX_DOWN.get(key, 999)
+            status = "OK" if value <= limit else "BREACH"
+            print(f"[PIS]  {key} PIS Down = {value} (limit: {limit}) [{status}]")
+            if value > limit:
+                alerts.append(f"{key} PIS Down = {value} (limit: {limit})")
+        except Exception as e:
+            results[key] = None
+            alerts.append(f"{key} PIS Down: could not read value ({e})")
+            print(f"[PIS]  ERROR reading {key} PIS Down: {e}")
+
+    return {"values": results, "alerts": alerts}
+
+
+# ── Check 2: Fleet Dashboard (Communicating) ───────────────────────────────────
+def check_fleet_dashboard(page) -> dict:
+    """Navigate to Fleet Dashboard, filter by Communicating, extract total fleet count."""
+    print("[FLEET] Navigating to Fleet Dashboard...")
+    page.goto("https://mtcbusits.in/avls/Dashboard/Fleetdashboard", timeout=30000)
+    page.wait_for_timeout(3000)
+
+    alerts = []
+    fleet_count = None
+
+    try:
+        # Click the Data Delay dropdown input
+        dropdown = page.locator("input[placeholder='Select Data Delay'], [placeholder='Select Data Delay']").first
+        dropdown.wait_for(timeout=10000)
+        dropdown.click()
+        page.wait_for_timeout(1000)
+
+        # Select "Communicating" option from the dropdown popup
+        selected = False
+        # Strategy 1: Kendo option role
+        try:
+            opt = page.get_by_role("option", name="Communicating").first
+            if opt.is_visible(timeout=2000):
+                opt.click()
+                selected = True
+        except Exception:
+            pass
+
+        # Strategy 2: Kendo list item class
+        if not selected:
+            try:
+                opt = page.locator("li.k-item, .k-list-item, li").filter(has_text="Communicating").first
+                if opt.is_visible(timeout=2000):
+                    opt.click()
+                    selected = True
+            except Exception:
+                pass
+
+        # Strategy 3: Text match
+        if not selected:
+            try:
+                opt = page.get_by_text("Communicating", exact=True).first
+                if opt.is_visible(timeout=2000):
+                    opt.click()
+                    selected = True
+            except Exception:
+                pass
+
+        if not selected:
+            # Fallback click via locator filter
+            page.locator("li").filter(has_text="Communicating").first.click()
+
+        page.wait_for_timeout(1000)
+        print("[FLEET] Selected 'Communicating' from dropdown.")
+    except Exception as e:
+        alerts.append(f"Fleet Dashboard: dropdown selection failed ({e})")
+        print(f"[FLEET] ERROR selecting dropdown: {e}")
+        return {"value": None, "alerts": alerts}
+
+    try:
+        # Click Search/Filter button
+        search_btn = page.locator("button:has-text('Search'), a:has-text('Search')").first
+        search_btn.click()
+        print("[FLEET] Clicked Search button.")
+    except Exception as e:
+        alerts.append(f"Fleet Dashboard: search button click failed ({e})")
+        print(f"[FLEET] ERROR clicking search: {e}")
+        return {"value": None, "alerts": alerts}
+
+    # Wait for loading to complete
+    try:
+        page.wait_for_selector(".k-loading-mask", state="hidden", timeout=15000)
+    except Exception:
+        pass
+    page.wait_for_timeout(4000)
+
+    try:
+        # 1. Extract Communicating Fleet count from kendo pager (e.g. '1 - 10 of 758 items')
+        pager_el = page.locator(".k-pager-info").first
+        if pager_el.is_visible(timeout=5000):
+            raw_pager = pager_el.inner_text().strip()
+            print(f"[FLEET] Pager text: {repr(raw_pager)}")
+            m = re.search(r"of\s+([\d,]+)\s+items", raw_pager, re.IGNORECASE)
+            if m:
+                fleet_count = int(m.group(1).replace(",", ""))
+
+        # 2. Fallback to top header card if pager not matched
+        if fleet_count is None:
+            total_el = page.locator(
+                "xpath=/html/body/ngx-app/ngx-pages/ngx-one-column-layout/nb-layout"
+                "/div/div/div/div/div/nb-layout-column/ngx-fleetdashboard/div/div"
+                "/div[2]/div[2]"
+            )
+            total_el.wait_for(timeout=5000)
+            raw = total_el.inner_text().strip()
+            print(f"[FLEET] Header raw text: {repr(raw)}")
+            tokens = re.findall(r'\b\d+\b', raw)
+            if tokens:
+                fleet_count = int(tokens[-1])
+
+        if fleet_count is not None:
+            status = "OK" if fleet_count >= FLEET_MIN_COMM else "BREACH"
+            print(f"[FLEET] Communicating Fleet = {fleet_count} (min: {FLEET_MIN_COMM}) [{status}]")
+            if fleet_count < FLEET_MIN_COMM:
+                alerts.append(f"Communicating Fleet = {fleet_count} (minimum: {FLEET_MIN_COMM})")
+        else:
+            alerts.append("Fleet Dashboard: failed to parse numeric count from pager or header")
+    except Exception as e:
+        alerts.append(f"Fleet Dashboard: could not read Communicating Fleet value ({e})")
+        print(f"[FLEET] ERROR reading fleet count: {e}")
+
+    return {"value": fleet_count, "alerts": alerts}
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main():
+    ts = now_ist()
+    print(f"\n{'='*65}")
+    print(f"  MTC Portal Health Monitor — {ts}")
+    print(f"{'='*65}\n")
+
+    if not USERNAME or not PASSWORD:
+        msg = f"[{ts}] CRITICAL: MTC_USERNAME or MTC_PASSWORD env variable not set."
+        print(msg)
+        send_alert(msg)
+        raise RuntimeError(msg)
+
+    all_alerts = []
+
+    # ── Determine proxy configuration ──────────────────────────────────────
+    # If INDIAN_PROXY is explicitly set (e.g. via GitHub Secret), use it directly.
+    # Otherwise, auto-fetch a free Indian proxy from public lists.
+    proxy_server = os.getenv("INDIAN_PROXY", "").strip()
+
+    if not proxy_server:
+        print("[PROXY] No INDIAN_PROXY env var set. Auto-fetching free Indian proxy...")
+        proxy_server = get_working_indian_proxy()
+
+    if proxy_server:
+        print(f"[PROXY] Using Indian proxy: {proxy_server}")
+        proxy_config = {"server": proxy_server}
+    else:
+        print("[PROXY] WARNING: No Indian proxy available. Attempting direct connection...")
+        print("[PROXY] This may fail if the runner IP is outside India.")
+        proxy_config = None
+
+    with sync_playwright() as p:
+        launch_kwargs = {"headless": True}
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+
+        browser = p.chromium.launch(**launch_kwargs)
+        context = browser.new_context()
+        page = context.new_page()
+
+        try:
+            # Verify IP location before proceeding
+            if proxy_config:
+                try:
+                    page.goto("https://ipapi.co/json/", timeout=15000)
+                    ip_info = json.loads(page.locator("body").inner_text())
+                    print(f"[PROXY] Browser IP: {ip_info.get('ip')} | Country: {ip_info.get('country_name')} ({ip_info.get('country_code')})")
+                except Exception as e:
+                    print(f"[PROXY] Could not verify IP location: {e}")
+
+            # Login
+            login_to_portal(page)
+
+            # Check 1 — PIS Display Connectivity
+            pis_result = check_pis_display(page)
+            all_alerts.extend(pis_result["alerts"])
+
+            # Check 2 — Fleet Dashboard
+            fleet_result = check_fleet_dashboard(page)
+            all_alerts.extend(fleet_result["alerts"])
+
+            # Format full metrics breakdown for all 4 values
+            pis_vals = pis_result["values"]
+            comm_val = fleet_result["value"]
+            
+            v2 = pis_vals.get("2L", "N/A")
+            v4 = pis_vals.get("4L", "N/A")
+            v10 = pis_vals.get("10L", "N/A")
+            
+            st_2 = "❌ ERROR" if v2 is None else ("⚠️ BREACH" if (isinstance(v2, int) and v2 > PIS_MAX_DOWN.get("2L", 999)) else "✅ OK")
+            st_4 = "❌ ERROR" if v4 is None else ("⚠️ BREACH" if (isinstance(v4, int) and v4 > PIS_MAX_DOWN.get("4L", 999)) else "✅ OK")
+            st_10 = "❌ ERROR" if v10 is None else ("⚠️ BREACH" if (isinstance(v10, int) and v10 > PIS_MAX_DOWN.get("10L", 999)) else "✅ OK")
+            st_comm = "❌ ERROR" if comm_val is None else ("⚠️ BREACH" if (isinstance(comm_val, int) and comm_val < FLEET_MIN_COMM) else "✅ OK")
+
+            full_report = (
+                f"MTC Portal Health @ {ts}\n\n"
+                f"• 2L PIS Down: {v2} (max: {PIS_MAX_DOWN.get('2L')}) {st_2}\n"
+                f"• 4L PIS Down: {v4} (max: {PIS_MAX_DOWN.get('4L')}) {st_4}\n"
+                f"• 10L PIS Down: {v10} (max: {PIS_MAX_DOWN.get('10L')}) {st_10}\n"
+                f"• Communicating Fleet: {comm_val} (min: {FLEET_MIN_COMM}) {st_comm}"
+            )
+
+            print(f"\n[SUMMARY] {ts}")
+            print(f"  PIS Down   — 2L: {v2}, 4L: {v4}, 10L: {v10}")
+            print(f"  Fleet Comm — {comm_val}")
+
+            if all_alerts:
+                print(f"\n[ALERT] Threshold breach(es) detected:\n{full_report}")
+                send_alert(full_report)
+            else:
+                print("\n[OK] All metrics within thresholds. No alerts sent.")
+
+        except Exception as exc:
+            print(f"\n[ERROR] Unexpected exception: {exc}")
+            try:
+                page.screenshot(path="debug_failure.png")
+                print("[DEBUG] Screenshot saved: debug_failure.png")
+            except Exception:
+                pass
+            error_msg = f"MTC Portal Monitor ERROR @ {ts}\n{exc}"
+            send_alert(error_msg)
+            raise
+
+        finally:
+            context.close()
+            browser.close()
+
+
+if __name__ == "__main__":
+    main()
