@@ -93,6 +93,7 @@ def get_working_indian_proxy() -> str:
     print("[PROXY] Scanning for free Indian proxies with HTTPS CONNECT support...")
     sources = [
         "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text&country=in&protocol=http,socks5",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/in.txt",
         "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt"
     ]
 
@@ -113,14 +114,14 @@ def get_working_indian_proxy() -> str:
 
     def _test_proxy(p):
         try:
-            r = requests.get("https://mtcbusits.in/", proxies={"http": p, "https": p}, timeout=5)
+            r = requests.get("https://mtcbusits.in/", proxies={"http": p, "https": p}, timeout=6)
             if r.status_code == 200:
                 return p
         except Exception:
             return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_test_proxy, p): p for p in candidate_proxies[:35]}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(_test_proxy, p): p for p in candidate_proxies[:120]}
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res:
@@ -352,15 +353,28 @@ def login_to_portal(page):
 def check_pis_display(page) -> dict:
     """Navigate to PIS Display Connectivity page and extract down counts."""
     print("[PIS]  Navigating to PIS Display Connectivity...")
-    page.goto("https://mtcbusits.in/avls/Vehicletracking/PISDisplayConnectivity", timeout=30000)
+    page.goto("https://mtcbusits.in/avls/Vehicletracking/PISDisplayConnectivity", timeout=45000, wait_until="domcontentloaded")
 
-    page.wait_for_selector("kendo-grid-toolbar", timeout=15000)
+    # Wait for toolbar with reload retry if slow
+    for wait_att in range(3):
+        try:
+            page.wait_for_selector("kendo-grid-toolbar", timeout=30000)
+            break
+        except Exception:
+            if wait_att < 2:
+                print(f"[PIS]  kendo-grid-toolbar not ready, reloading (attempt {wait_att+1}/3)...")
+                try:
+                    page.reload(timeout=30000, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+            else:
+                raise
 
     try:
-        page.wait_for_selector(".k-loading-mask", state="hidden", timeout=15000)
+        page.wait_for_selector(".k-loading-mask", state="hidden", timeout=25000)
     except Exception:
         pass
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(3000)
 
     xpaths = {
         "2L":  '//*[@id="gridlistid"]/kendo-grid-toolbar/div/div[7]/div[1]/span[3]',
@@ -395,7 +409,7 @@ def check_pis_display(page) -> dict:
 def check_fleet_dashboard(page) -> dict:
     """Navigate to Fleet Dashboard, filter by Communicating, extract total fleet count."""
     print("[FLEET] Navigating to Fleet Dashboard...")
-    page.goto("https://mtcbusits.in/avls/Dashboard/Fleetdashboard", timeout=30000)
+    page.goto("https://mtcbusits.in/avls/Dashboard/Fleetdashboard", timeout=45000, wait_until="domcontentloaded")
     page.wait_for_timeout(3000)
 
     alerts = []
@@ -404,8 +418,9 @@ def check_fleet_dashboard(page) -> dict:
     try:
         # Locate the Data Delay multiselect specifically
         dd = page.locator("kendo-multiselect#divdd8, #divdd8, kendo-multiselect[placeholder='Select Data Delay']").first
-        if not dd.is_visible(timeout=5000):
+        if not dd.is_visible(timeout=15000):
             dd = page.locator("kendo-multiselect").filter(has_text=re.compile(r"Data Delay", re.I)).first
+        dd.wait_for(timeout=20000)
         dd.scroll_into_view_if_needed()
         dd.click()
         page.wait_for_timeout(1000)
