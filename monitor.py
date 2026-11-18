@@ -108,16 +108,25 @@ def get_working_indian_proxy() -> str:
         except Exception:
             pass
 
-    print(f"[PROXY] Found {len(candidate_proxies)} candidate proxies to test...")
-    # Test up to 15 candidates against mtcbusits.in with a short timeout
-    for i, p in enumerate(candidate_proxies[:15]):
+    print(f"[PROXY] Found {len(candidate_proxies)} candidate proxies. Testing in parallel...")
+    import concurrent.futures
+
+    def _test_proxy(p):
         try:
-            r = requests.get("https://mtcbusits.in/", proxies={"http": p, "https": p}, timeout=4)
+            r = requests.get("https://mtcbusits.in/", proxies={"http": p, "https": p}, timeout=5)
             if r.status_code == 200:
-                print(f"[PROXY] ✅ Working proxy found: {p}")
                 return p
         except Exception:
-            pass
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_test_proxy, p): p for p in candidate_proxies[:35]}
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res:
+                print(f"[PROXY] ✅ Fast working proxy found: {res}")
+                executor.shutdown(wait=False, cancel_futures=True)
+                return res
 
     print("[PROXY] No working public proxy found.")
     return ""
@@ -216,7 +225,20 @@ def login_to_portal(page):
                 raise RuntimeError(f"Cannot reach https://mtcbusits.in/ after 3 attempts: {e}")
             page.wait_for_timeout(3000)
 
-    page.wait_for_selector("input[formcontrolname='captcha'], input[name='captcha']", timeout=30000)
+    # Wait for login form to render with automatic reload retry
+    for render_attempt in range(3):
+        try:
+            page.wait_for_selector("input[formcontrolname='captcha'], input[name='captcha']", timeout=20000)
+            break
+        except Exception:
+            if render_attempt < 2:
+                print(f"[LOGIN]  Form not ready yet, reloading page (attempt {render_attempt+1}/3)...")
+                try:
+                    page.reload(timeout=30000, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+            else:
+                raise
 
     # Fast OCR
     ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
