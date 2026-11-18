@@ -308,14 +308,18 @@ def login_to_portal(page):
         cap_input.fill(refined_captcha)
         page.wait_for_timeout(200)
 
-        # Click Login
+        # Click Login with short timeout so it doesn't hang if already navigating
         old_src = src
-        page.locator("button:has-text('Login')").first.click()
+        try:
+            login_btn = page.locator("button:has-text('Login'), button[type='submit']").first
+            login_btn.click(timeout=5000)
+        except Exception:
+            pass
 
         # Check for success or error toast
         t0 = time.time()
-        while time.time() - t0 < 4.0:
-            page.wait_for_timeout(200)
+        while time.time() - t0 < 6.0:
+            page.wait_for_timeout(300)
             cur_url = page.url.lower().rstrip("/")
             if "login" not in cur_url and cur_url != "https://mtcbusits.in":
                 logged_in = True
