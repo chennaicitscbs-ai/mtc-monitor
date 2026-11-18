@@ -357,25 +357,13 @@ def login_to_portal(page):
 def check_pis_display(page) -> dict:
     """Navigate to PIS Display Connectivity page and extract down counts."""
     print("[PIS]  Navigating to PIS Display Connectivity...")
-    page.goto("https://mtcbusits.in/avls/Vehicletracking/PISDisplayConnectivity", timeout=45000, wait_until="domcontentloaded")
+    page.goto("https://mtcbusits.in/avls/Vehicletracking/PISDisplayConnectivity", timeout=60000, wait_until="domcontentloaded")
 
-    # Wait for toolbar with reload retry if slow
-    for wait_att in range(3):
-        try:
-            page.wait_for_selector("kendo-grid-toolbar", timeout=30000)
-            break
-        except Exception:
-            if wait_att < 2:
-                print(f"[PIS]  kendo-grid-toolbar not ready, reloading (attempt {wait_att+1}/3)...")
-                try:
-                    page.reload(timeout=30000, wait_until="domcontentloaded")
-                except Exception:
-                    pass
-            else:
-                raise
+    # Allow up to 60s for Angular bundle and grid toolbar to finish loading
+    page.wait_for_selector("kendo-grid-toolbar", timeout=60000)
 
     try:
-        page.wait_for_selector(".k-loading-mask", state="hidden", timeout=25000)
+        page.wait_for_selector(".k-loading-mask", state="hidden", timeout=30000)
     except Exception:
         pass
     page.wait_for_timeout(3000)
@@ -413,7 +401,7 @@ def check_pis_display(page) -> dict:
 def check_fleet_dashboard(page) -> dict:
     """Navigate to Fleet Dashboard, filter by Communicating, extract total fleet count."""
     print("[FLEET] Navigating to Fleet Dashboard...")
-    page.goto("https://mtcbusits.in/avls/Dashboard/Fleetdashboard", timeout=45000, wait_until="domcontentloaded")
+    page.goto("https://mtcbusits.in/avls/Dashboard/Fleetdashboard", timeout=60000, wait_until="domcontentloaded")
     page.wait_for_timeout(3000)
 
     alerts = []
@@ -422,7 +410,7 @@ def check_fleet_dashboard(page) -> dict:
     try:
         # Target specifically the Data Delay multiselect (id='divdd8')
         dd = page.locator("kendo-multiselect#divdd8, #divdd8, kendo-multiselect[placeholder='Select Data Delay']").first
-        dd.wait_for(state="attached", timeout=30000)
+        dd.wait_for(state="attached", timeout=45000)
         dd.scroll_into_view_if_needed()
         dd.click()
         page.wait_for_timeout(1000)
