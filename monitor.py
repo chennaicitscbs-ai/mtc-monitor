@@ -420,11 +420,9 @@ def check_fleet_dashboard(page) -> dict:
     fleet_count = None
 
     try:
-        # Locate the Data Delay multiselect specifically
+        # Target specifically the Data Delay multiselect (id='divdd8')
         dd = page.locator("kendo-multiselect#divdd8, #divdd8, kendo-multiselect[placeholder='Select Data Delay']").first
-        if not dd.is_visible(timeout=15000):
-            dd = page.locator("kendo-multiselect").filter(has_text=re.compile(r"Data Delay", re.I)).first
-        dd.wait_for(timeout=20000)
+        dd.wait_for(state="attached", timeout=30000)
         dd.scroll_into_view_if_needed()
         dd.click()
         page.wait_for_timeout(1000)
