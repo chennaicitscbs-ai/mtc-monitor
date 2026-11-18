@@ -14,6 +14,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up OpenVPN client
+        if: ${{ env.OVPN_CONFIG != '' }}
+        env:
+          OVPN_CONFIG: ${{ secrets.OVPN_CONFIG }}
+          VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
+          VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn openvpn-systemd-resolved
+          echo "$OVPN_CONFIG" > /tmp/client.ovpn
+          printf "%s\n%s\n" "$VPN_USERNAME" "$VPN_PASSWORD" > /tmp/vpn_auth.txt
+          chmod 600 /tmp/vpn_auth.txt /tmp/client.ovpn
+          sudo openvpn --config /tmp/client.ovpn --auth-user-pass /tmp/vpn_auth.txt --daemon vpn-tunnel
+          
+          # Wait up to 15 seconds for VPN tunnel to initialize
+          for i in {1..15}; do
+            if ip a show tun0 > /dev/null 2>&1; then
+              echo "VPN tunnel tun0 is UP!"
+              break
+            fi
+            sleep 1
+          done
+          
+          echo "Outgoing IP:"
+          curl -s https://api.ipify.org || true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -30,6 +56,7 @@ jobs:
           MTC_USERNAME: ${{ secrets.MTC_USERNAME }}
           MTC_PASSWORD: ${{ secrets.MTC_PASSWORD }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          INDIAN_PROXY: ${{ secrets.INDIAN_PROXY }}
         run: python monitor.py
 
       - name: Upload debug screenshot on failure
