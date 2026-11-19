@@ -2,7 +2,10 @@ name: MTC Portal Health Monitor
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '3 * * * *'
+    - cron: '18 * * * *'
+    - cron: '33 * * * *'
+    - cron: '48 * * * *'
   workflow_dispatch:
 
 jobs:
