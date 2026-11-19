@@ -34,6 +34,16 @@ with open(_CONFIG_PATH, "r", encoding="utf-8") as _f:
 PIS_MAX_DOWN     = CONFIG["pis_display_max_down"]          # {"2L": 20, "4L": 6, "10L": 3}
 FLEET_MIN_COMM   = CONFIG["fleet_dashboard_min_communicating"]  # 2500
 
+# ── Load local .env if present ────────────────────────────────────────────────
+_env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path, "r", encoding="utf-8") as _ef:
+        for _line in _ef:
+            _line = _line.strip()
+            if _line and "=" in _line and not _line.startswith("#"):
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 # ── Credentials from environment (GitHub Secrets or defaults) ─────────────────
 USERNAME  = os.getenv("MTC_USERNAME", "").strip()
 PASSWORD  = os.getenv("MTC_PASSWORD", "").strip()
