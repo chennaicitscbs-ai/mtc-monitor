@@ -588,11 +588,10 @@ def main():
             print(f"  Fleet Comm — {comm_val}")
 
             if all_alerts:
-                print(f"\n[ALERT] Threshold breach(es) detected:\n{full_report}")
+                print(f"\n[ALERT] Threshold breach(es) detected! Sending alert:\n{full_report}")
                 send_alert(full_report)
             else:
-                print("\n[OK] All metrics within thresholds. Sending status report...")
-                send_alert(full_report)
+                print("\n[OK] All metrics within thresholds. No breach detected — alert not sent.")
 
         except Exception as exc:
             print(f"\n[ERROR] Unexpected exception: {exc}")
