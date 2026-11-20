@@ -1,10 +1,25 @@
 {
+  "pis_display_max_down_day": {
+    "2L": 20,
+    "4L": 6,
+    "10L": 3
+  },
+  "pis_display_max_down_night": {
+    "2L": 3,
+    "4L": 3,
+    "10L": 3
+  },
   "pis_display_max_down": {
     "2L": 20,
     "4L": 6,
     "10L": 3
   },
+  "fleet_dashboard_min_communicating_day": 2500,
+  "fleet_dashboard_min_communicating_night": 3,
   "fleet_dashboard_min_communicating": 2500,
+  "night_window_hours": {
+    "start_hour": 23,
+    "end_hour": 5
+  },
   "timezone": "Asia/Kolkata"
 }
-
