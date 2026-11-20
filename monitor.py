@@ -48,11 +48,35 @@ if os.path.exists(_env_path):
 USERNAME  = os.getenv("MTC_USERNAME", "").strip()
 PASSWORD  = os.getenv("MTC_PASSWORD", "").strip()
 
-# ── IST helper ────────────────────────────────────────────────────────────────
+# ── IST helper & Thresholds ───────────────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def now_ist() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def get_current_thresholds():
+    """
+    Returns (pis_limits, fleet_min, is_night, window_label) based on current IST time.
+    Night window: 11:00 PM (23:00) to 5:00 AM (05:00) IST.
+    During night:
+      - 2L, 4L, 10L PIS down max threshold: 3
+      - Communicating fleet min threshold: 3
+    During day (5:00 AM to 11:00 PM IST):
+      - 2L: 20, 4L: 6, 10L: 3
+      - Communicating fleet min threshold: 2500
+    """
+    now = datetime.now(IST)
+    is_night = (now.hour >= 23 or now.hour < 5)
+    if is_night:
+        pis_limits = CONFIG.get("pis_display_max_down_night", {"2L": 3, "4L": 3, "10L": 3})
+        fleet_min = CONFIG.get("fleet_dashboard_min_communicating_night", 3)
+        window_label = "NIGHT (11 PM - 5 AM)"
+    else:
+        pis_limits = CONFIG.get("pis_display_max_down_day", CONFIG.get("pis_display_max_down", {"2L": 20, "4L": 6, "10L": 3}))
+        fleet_min = CONFIG.get("fleet_dashboard_min_communicating_day", CONFIG.get("fleet_dashboard_min_communicating", 2500))
+        window_label = "DAY (5 AM - 11 PM)"
+    return pis_limits, fleet_min, is_night, window_label
 
 
 # ── Alert via ntfy.sh ─────────────────────────────────────────────────────────
@@ -364,8 +388,10 @@ def login_to_portal(page):
 
 
 # ── Check 1: PIS Display Connectivity ─────────────────────────────────────────
-def check_pis_display(page) -> dict:
+def check_pis_display(page, pis_limits: dict = None) -> dict:
     """Navigate to PIS Display Connectivity page and extract down counts."""
+    if pis_limits is None:
+        pis_limits = PIS_MAX_DOWN
     print("[PIS]  Navigating to PIS Display Connectivity...")
     page.goto("https://mtcbusits.in/avls/Vehicletracking/PISDisplayConnectivity", timeout=60000, wait_until="domcontentloaded")
 
@@ -394,7 +420,7 @@ def check_pis_display(page) -> dict:
             raw = el.inner_text().strip()
             value = int("".join(filter(str.isdigit, raw)))
             results[key] = value
-            limit = PIS_MAX_DOWN.get(key, 999)
+            limit = pis_limits.get(key, 999)
             status = "OK" if value <= limit else "BREACH"
             print(f"[PIS]  {key} PIS Down = {value} (limit: {limit}) [{status}]")
             if value > limit:
@@ -408,8 +434,10 @@ def check_pis_display(page) -> dict:
 
 
 # ── Check 2: Fleet Dashboard (Communicating) ───────────────────────────────────
-def check_fleet_dashboard(page) -> dict:
+def check_fleet_dashboard(page, min_comm: int = None) -> dict:
     """Navigate to Fleet Dashboard, filter by Communicating, extract total fleet count."""
+    if min_comm is None:
+        min_comm = FLEET_MIN_COMM
     print("[FLEET] Navigating to Fleet Dashboard...")
     page.goto("https://mtcbusits.in/avls/Dashboard/Fleetdashboard", timeout=60000, wait_until="domcontentloaded")
     page.wait_for_timeout(3000)
@@ -481,10 +509,10 @@ def check_fleet_dashboard(page) -> dict:
                         break
 
         if fleet_count is not None:
-            status = "OK" if fleet_count >= FLEET_MIN_COMM else "BREACH"
-            print(f"[FLEET] Communicating Fleet = {fleet_count} (min: {FLEET_MIN_COMM}) [{status}]")
-            if fleet_count < FLEET_MIN_COMM:
-                alerts.append(f"Communicating Fleet = {fleet_count} (minimum: {FLEET_MIN_COMM})")
+            status = "OK" if fleet_count >= min_comm else "BREACH"
+            print(f"[FLEET] Communicating Fleet = {fleet_count} (min: {min_comm}) [{status}]")
+            if fleet_count < min_comm:
+                alerts.append(f"Communicating Fleet = {fleet_count} (minimum: {min_comm})")
         else:
             alerts.append("Fleet Dashboard: failed to parse numeric count from pager")
     except Exception as e:
@@ -498,8 +526,13 @@ def check_fleet_dashboard(page) -> dict:
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     ts = now_ist()
+    pis_limits, fleet_min, is_night, window_label = get_current_thresholds()
+
     print(f"\n{'='*65}")
     print(f"  MTC Portal Health Monitor — {ts}")
+    print(f"  Threshold Mode: {window_label}")
+    print(f"  PIS Limits (Max Down)   : {pis_limits}")
+    print(f"  Fleet Comm Minimum      : {fleet_min}")
     print(f"{'='*65}\n")
 
     if not USERNAME or not PASSWORD:
@@ -555,11 +588,11 @@ def main():
             login_to_portal(page)
 
             # Check 1 — PIS Display Connectivity
-            pis_result = check_pis_display(page)
+            pis_result = check_pis_display(page, pis_limits=pis_limits)
             all_alerts.extend(pis_result["alerts"])
 
             # Check 2 — Fleet Dashboard
-            fleet_result = check_fleet_dashboard(page)
+            fleet_result = check_fleet_dashboard(page, min_comm=fleet_min)
             all_alerts.extend(fleet_result["alerts"])
 
             # Format report
@@ -570,22 +603,22 @@ def main():
             v4 = pis_vals.get("4L", "N/A")
             v10 = pis_vals.get("10L", "N/A")
             
-            st_2 = "❌ ERROR" if v2 is None else ("⚠️ BREACH" if (isinstance(v2, int) and v2 > PIS_MAX_DOWN.get("2L", 999)) else "✅ OK")
-            st_4 = "❌ ERROR" if v4 is None else ("⚠️ BREACH" if (isinstance(v4, int) and v4 > PIS_MAX_DOWN.get("4L", 999)) else "✅ OK")
-            st_10 = "❌ ERROR" if v10 is None else ("⚠️ BREACH" if (isinstance(v10, int) and v10 > PIS_MAX_DOWN.get("10L", 999)) else "✅ OK")
-            st_comm = "❌ ERROR" if comm_val is None else ("⚠️ BREACH" if (isinstance(comm_val, int) and comm_val < FLEET_MIN_COMM) else "✅ OK")
+            st_2 = "❌ ERROR" if v2 is None else ("⚠️ BREACH" if (isinstance(v2, int) and v2 > pis_limits.get("2L", 999)) else "✅ OK")
+            st_4 = "❌ ERROR" if v4 is None else ("⚠️ BREACH" if (isinstance(v4, int) and v4 > pis_limits.get("4L", 999)) else "✅ OK")
+            st_10 = "❌ ERROR" if v10 is None else ("⚠️ BREACH" if (isinstance(v10, int) and v10 > pis_limits.get("10L", 999)) else "✅ OK")
+            st_comm = "❌ ERROR" if comm_val is None else ("⚠️ BREACH" if (isinstance(comm_val, int) and comm_val < fleet_min) else "✅ OK")
 
             full_report = (
-                f"MTC Portal Health @ {ts}\n\n"
-                f"• 2L PIS Down: {v2} (max: {PIS_MAX_DOWN.get('2L')}) {st_2}\n"
-                f"• 4L PIS Down: {v4} (max: {PIS_MAX_DOWN.get('4L')}) {st_4}\n"
-                f"• 10L PIS Down: {v10} (max: {PIS_MAX_DOWN.get('10L')}) {st_10}\n"
-                f"• Communicating Fleet: {comm_val} (min: {FLEET_MIN_COMM}) {st_comm}"
+                f"MTC Portal Health @ {ts} [{window_label}]\n\n"
+                f"• 2L PIS Down: {v2} (max: {pis_limits.get('2L')}) {st_2}\n"
+                f"• 4L PIS Down: {v4} (max: {pis_limits.get('4L')}) {st_4}\n"
+                f"• 10L PIS Down: {v10} (max: {pis_limits.get('10L')}) {st_10}\n"
+                f"• Communicating Fleet: {comm_val} (min: {fleet_min}) {st_comm}"
             )
 
-            print(f"\n[SUMMARY] {ts}")
-            print(f"  PIS Down   — 2L: {v2}, 4L: {v4}, 10L: {v10}")
-            print(f"  Fleet Comm — {comm_val}")
+            print(f"\n[SUMMARY] {ts} [{window_label}]")
+            print(f"  PIS Down   — 2L: {v2} (max {pis_limits.get('2L')}), 4L: {v4} (max {pis_limits.get('4L')}), 10L: {v10} (max {pis_limits.get('10L')})")
+            print(f"  Fleet Comm — {comm_val} (min {fleet_min})")
 
             if all_alerts:
                 print(f"\n[ALERT] Threshold breach(es) detected! Sending alert:\n{full_report}")
